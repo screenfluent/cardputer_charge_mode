@@ -74,7 +74,9 @@ arduino-cli compile --fqbn esp32:esp32:m5stack_cardputer --output-dir ./build .
 
 ## Technical Notes
 
-The CardPuter's LED and LCD backlight share a power rail. The backlight PWM must maintain a minimum duty cycle (~30%) for the LED to function. The display is put to sleep via ST7789 SLPIN command, so the screen appears off despite the backlight being partially on.
+**Power sharing:** The CardPuter's LED and LCD backlight share a power rail. The backlight PWM must maintain a minimum duty cycle (~30%) for the LED to function. The display is put to sleep via ST7789 SLPIN command, so the screen appears off despite the backlight being partially on. If the SPI bus is already claimed (e.g., by M5Launcher), the LCD may stay visible but the LED indicator still works.
+
+**Battery reading:** Uses GPIO10 (ADC1_CH9) with 8-sample averaging and ±3% hysteresis to prevent LED flickering near zone boundaries.
 
 ## Roadmap
 

@@ -20,7 +20,6 @@
 #include <driver/rmt_tx.h>
 #include <driver/spi_master.h>
 #include <driver/gpio.h>
-#include <driver/adc.h>
 
 // ============================================================================
 // Pin Definitions (CardPuter ADV)
@@ -57,43 +56,57 @@ spi_device_handle_t spi_lcd = NULL;
 // Battery Functions
 // ============================================================================
 
+// Hysteresis: current color zone (0-3), -1 = unset
+int current_zone = -1;
+
 /**
  * Read battery level as percentage (0-100).
- * CardPuter has 2:1 voltage divider on GPIO10 (ADC1_CH0).
+ * CardPuter ADV has 2:1 voltage divider on GPIO10 (ADC1_CH9 on ESP32-S3).
+ * Uses 8-sample moving average for stability.
  */
 int getBatteryLevel() {
-  adc1_config_width(ADC_WIDTH_BIT_12);
-  adc1_config_channel_atten(ADC1_CHANNEL_0, ADC_ATTEN_DB_11);
-
-  // Average multiple readings for stability
-  int sum = 0;
-  for (int i = 0; i < 10; i++) {
-    sum += adc1_get_raw(ADC1_CHANNEL_0);
-    delay(10);
+  long sum = 0;
+  for (int i = 0; i < 8; i++) {
+    sum += analogReadMilliVolts(10);  // GPIO10
+    delay(5);
   }
-  int adc_val = sum / 10;
+  float voltage = (sum / 8) * 2.0f / 1000.0f;  // 2:1 divider, mV to V
 
-  // Convert to voltage (12-bit ADC, 3.3V ref, 2:1 divider)
-  float voltage = (adc_val / 4095.0f) * 3.3f * 2.0f;
-
-  // Map voltage to percentage
   int level = ((voltage - BATTERY_MIN_V) / (BATTERY_MAX_V - BATTERY_MIN_V)) * 100;
   return constrain(level, 0, 100);
 }
 
 /**
- * Get LED color based on battery level.
+ * Get LED color based on battery level with hysteresis.
  * 4 zones: Red (0-25%), Orange (25-50%), Yellow (50-75%), Green (75-100%)
+ * Hysteresis band: +/-3% to prevent flickering at zone edges.
  */
 void getBatteryColor(int level, uint8_t* r, uint8_t* g, uint8_t* b) {
-  if (level < 25) {
-    *r = 255; *g = 0;   *b = 0;    // Red
-  } else if (level < 50) {
-    *r = 255; *g = 128; *b = 0;    // Orange
-  } else if (level < 75) {
-    *r = 255; *g = 255; *b = 0;    // Yellow
+  // Zone thresholds with 3% hysteresis
+  int new_zone;
+  if (current_zone == -1) {
+    // First reading - no hysteresis
+    if (level < 25) new_zone = 0;
+    else if (level < 50) new_zone = 1;
+    else if (level < 75) new_zone = 2;
+    else new_zone = 3;
   } else {
-    *r = 0;   *g = 255; *b = 0;    // Green
+    // Apply hysteresis - only change zone if we cross threshold +/- 3%
+    new_zone = current_zone;
+    if (current_zone == 0 && level >= 28) new_zone = 1;
+    else if (current_zone == 1 && level < 22) new_zone = 0;
+    else if (current_zone == 1 && level >= 53) new_zone = 2;
+    else if (current_zone == 2 && level < 47) new_zone = 1;
+    else if (current_zone == 2 && level >= 78) new_zone = 3;
+    else if (current_zone == 3 && level < 72) new_zone = 2;
+  }
+  current_zone = new_zone;
+
+  switch (new_zone) {
+    case 0: *r = 255; *g = 0;   *b = 0;   break;  // Red
+    case 1: *r = 255; *g = 128; *b = 0;   break;  // Orange
+    case 2: *r = 255; *g = 255; *b = 0;   break;  // Yellow
+    default: *r = 0;  *g = 255; *b = 0;   break;  // Green
   }
 }
 
@@ -175,15 +188,16 @@ esp_err_t ws2812_encoder_new(rmt_encoder_handle_t *ret_encoder) {
     return ESP_FAIL;
   }
 
-  // Reset code: 280us low
-  encoder->reset_code.level0 = 0; encoder->reset_code.duration0 = 140;
-  encoder->reset_code.level1 = 0; encoder->reset_code.duration1 = 140;
+  // Reset code: >50us low (use 80us for safety margin)
+  encoder->reset_code.level0 = 0; encoder->reset_code.duration0 = 400;
+  encoder->reset_code.level1 = 0; encoder->reset_code.duration1 = 400;
 
   *ret_encoder = &encoder->base;
   return ESP_OK;
 }
 
 void setLedColor(uint8_t r, uint8_t g, uint8_t b) {
+  if (!led_chan || !led_encoder) return;
   uint8_t data[3] = {g, r, b};  // WS2812 uses GRB order
   rmt_transmit_config_t cfg = {};
   rmt_transmit(led_chan, led_encoder, data, sizeof(data), &cfg);
@@ -194,6 +208,7 @@ void setLedColor(uint8_t r, uint8_t g, uint8_t b) {
 // ============================================================================
 
 void lcd_cmd(uint8_t cmd) {
+  if (!spi_lcd) return;
   gpio_set_level((gpio_num_t)LCD_DC, 0);
   spi_transaction_t t = {};
   t.length = 8;
@@ -202,6 +217,7 @@ void lcd_cmd(uint8_t cmd) {
 }
 
 void lcd_data(uint8_t data) {
+  if (!spi_lcd) return;
   gpio_set_level((gpio_num_t)LCD_DC, 1);
   spi_transaction_t t = {};
   t.length = 8;
@@ -261,7 +277,10 @@ void setup() {
   chan_cfg.hpoint = 0;
   ledc_channel_config(&chan_cfg);
 
-  // 2. Initialize SPI for LCD
+  // 2. Initialize SPI for LCD (non-fatal - LED is priority)
+  //    Note: RGB LED and backlight share power. If SPI fails, we can't sleep
+  //    the LCD, but we MUST keep backlight on or LED won't work. Trade-off:
+  //    working LED indicator > sleeping display.
   gpio_set_direction((gpio_num_t)LCD_DC, GPIO_MODE_OUTPUT);
   gpio_set_direction((gpio_num_t)LCD_RST, GPIO_MODE_OUTPUT);
 
@@ -271,28 +290,31 @@ void setup() {
   bus_cfg.sclk_io_num = LCD_SCK;
   bus_cfg.quadwp_io_num = -1;
   bus_cfg.quadhd_io_num = -1;
-  spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
+  esp_err_t spi_err = spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
 
-  spi_device_interface_config_t dev_cfg = {};
-  dev_cfg.clock_speed_hz = 40000000;
-  dev_cfg.mode = 0;
-  dev_cfg.spics_io_num = LCD_CS;
-  dev_cfg.queue_size = 1;
-  spi_bus_add_device(SPI2_HOST, &dev_cfg, &spi_lcd);
+  // ESP_ERR_INVALID_STATE = already initialized (OK to continue)
+  if (spi_err == ESP_OK || spi_err == ESP_ERR_INVALID_STATE) {
+    spi_device_interface_config_t dev_cfg = {};
+    dev_cfg.clock_speed_hz = 40000000;
+    dev_cfg.mode = 0;
+    dev_cfg.spics_io_num = LCD_CS;
+    dev_cfg.queue_size = 1;
+    if (spi_bus_add_device(SPI2_HOST, &dev_cfg, &spi_lcd) == ESP_OK) {
+      lcd_sleep();
+    }
+    // If add_device fails: LCD stays on but LED works (acceptable trade-off)
+  }
 
-  // 3. Put LCD to sleep
-  lcd_sleep();
-
-  // 4. Initialize WS2812 LED via RMT
+  // 4. Initialize WS2812 LED via RMT (proceed regardless of LCD status)
   rmt_tx_channel_config_t tx_cfg = {};
   tx_cfg.gpio_num = (gpio_num_t)LED_PIN;
   tx_cfg.clk_src = RMT_CLK_SRC_DEFAULT;
   tx_cfg.resolution_hz = 10000000;  // 10MHz = 100ns resolution
   tx_cfg.mem_block_symbols = 64;
   tx_cfg.trans_queue_depth = 4;
-  rmt_new_tx_channel(&tx_cfg, &led_chan);
-  ws2812_encoder_new(&led_encoder);
-  rmt_enable(led_chan);
+  if (rmt_new_tx_channel(&tx_cfg, &led_chan) != ESP_OK) return;
+  if (ws2812_encoder_new(&led_encoder) != ESP_OK) return;
+  if (rmt_enable(led_chan) != ESP_OK) return;
 
   // 5. Set initial LED color based on battery
   delay(50);
