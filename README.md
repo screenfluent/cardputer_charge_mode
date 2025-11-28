@@ -63,7 +63,6 @@ The CardPuter's LED and LCD backlight share a power rail. The backlight PWM must
 
 - [ ] Splash screen showing battery percentage at startup
 - [ ] Button press to temporarily show battery level on LCD
-- [ ] Web-based flasher (no tools needed)
 
 ## Inspiration
 
